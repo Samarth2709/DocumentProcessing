@@ -1,5 +1,7 @@
 import os
 import mimetypes
+import openai
+import re
 from unstructured.partition.auto import partition
 from unstructured.chunking.title import chunk_by_title
 from unstructured_client import UnstructuredClient
@@ -9,13 +11,14 @@ from unstructured.staging.base import dict_to_elements
 
 
 class DocumentProcessor:
-    def __init__(self, file_path, unstructured_api_key=None, chunking=True, exists_tables=False):
+    def __init__(self, file_path, unstructured_api_key=None, openai_api_key=None, chunking=True, exists_tables=False):
         """
         Initializes the DocumentProcessor class.
 
         Args:
             file_path (str): Full file path of the document.
             unstructured_api_key (str, optional): API key for the Unstructured API. Defaults to None.
+            openai_api_key (str, optional): API key for the OpenAI GPT-4 API. Defaults to None.
             chunking (bool, optional): Whether to chunk the document. Defaults to True.
             exists_tables (bool, optional): Whether the document contains tables. Defaults to False.
         """
@@ -23,12 +26,21 @@ class DocumentProcessor:
         self.file_path = file_path
         self.chunking = chunking
         self.exists_tables = exists_tables
+
         if unstructured_api_key is None:
             self.unstructured_api_key = os.getenv("SAMARTH_UNSTRUCTURED_API_KEY")
             if not self.unstructured_api_key:
                 raise ValueError("Unstructured API key must be provided or set in environment variables.")
         else:
             self.unstructured_api_key = unstructured_api_key
+
+        if openai_api_key is None:
+            self.openai_api_key = os.getenv("MOSAICAI_OPENAI_API_KEY")
+            if not self.openai_api_key:
+                raise ValueError("OpenAI API key must be provided or set in environment variables.")
+        else:
+            self.openai_api_key = openai_api_key
+
         self.elements = None
 
     def get_file_type(self):
@@ -104,10 +116,6 @@ class DocumentProcessor:
                     multipage_sections=True,
                 )
                 print(f"After chunking, we have {len(elements)} elements.")
-            print("Example element:", elements)
-            print("\nText: ", elements[0].text)
-            print("\nText: ", elements[0].category)
-            # {'type': 'Title', 'element_id': '7eb8a2636f10255abff6a602b57567ca', 'text': 'About Men', 'metadata': {'coordinates': {'points': ((42.0, 235.0), (42.0, 277.0), (381.0, 277.0), (381.0, 235.0)), 'system': 'PixelSpace', 'layout_width': 1700, 'layout_height': 2200}, 'filetype': 'application/pdf', 'languages': ['eng'], 'page_number': 1, 'filename': 'Elapsed Expectations Alan Lightman.pdf'}}
             return elements
         except SDKError as e:
             print(f"Error processing PDF: {e}")
@@ -153,7 +161,7 @@ class DocumentProcessor:
         markdown_text = ""
         print("Converting elements to Markdown...")
         for idx, element in enumerate(self.elements):
-            print(f"Processing element {idx+1}/{len(self.elements)}: {type(element)}")
+            print(f"Processing element {idx + 1}/{len(self.elements)}: {type(element)}")
             markdown_text += self.element_to_markdown(element)
         return markdown_text
 
@@ -175,13 +183,12 @@ class DocumentProcessor:
             if not text:
                 return ""  # Skip elements without text
 
-            print(f"Element type: {element_type}")
             if element_type == 'Title':
-                return f"# {text}\n"
+                return f"# {text}\n\n"
             elif element_type == 'Heading':
-                return f"## {text}\n"
+                return f"## {text}\n\n"
             elif element_type == 'Subheading':
-                return f"### {text}\n"
+                return f"### {text}\n\n"
             elif element_type == 'UnorderedList':
                 markdown = ""
                 for item in text.split('\n'):
@@ -201,13 +208,12 @@ class DocumentProcessor:
                 return f"{text}\n\n"
         elif hasattr(element, 'elements'):
             # Handle CompositeElement
-            print("Processing CompositeElement...")
             markdown = ""
             for sub_element in element.elements:
                 markdown += self.element_to_markdown(sub_element)
             return markdown
         else:
-            print("Unknown element type:\n", element, element.text)
+            print(f"Unknown element type: {element}")
             return ""
 
     def table_to_markdown(self, element):
@@ -230,6 +236,7 @@ class DocumentProcessor:
 
         Args:
             output_path (str): The file path where the Markdown content will be saved.
+            markdown_text (str, optional): The markdown text to save. If None, it will use the result from convert_to_markdown().
         """
         if markdown_text is None:
             markdown_text = self.convert_to_markdown()
@@ -240,6 +247,109 @@ class DocumentProcessor:
         else:
             print("No Markdown content to save.")
 
+    def polish_markdown_with_gpt(self, markdown_content):
+        """
+        Uses the GPT-4 API to fix OCR errors in the markdown content.
+
+        Args:
+            markdown_content (str): The markdown content to polish.
+
+        Returns:
+            str: The polished markdown content.
+        """
+        # Split the markdown content into chunks
+        chunks = self.split_markdown_into_chunks(markdown_content)
+        print(f"Split markdown content into {len(chunks)} chunks.")
+
+        polished_chunks = []
+        for idx, chunk in enumerate(chunks):
+            print(f"Processing chunk {idx + 1}/{len(chunks)}")
+            polished_chunk = self.polish_chunk_with_gpt(chunk)
+            if polished_chunk:
+                polished_chunks.append(polished_chunk)
+            else:
+                print(f"Failed to polish chunk {idx + 1}")
+                polished_chunks.append(chunk)  # Append original chunk if polishing failed
+
+        polished_markdown = "\n".join(polished_chunks)
+        return polished_markdown
+
+    def split_markdown_into_chunks(self, markdown_content, min_chunk_size=500, max_chunk_size=2000):
+        """
+        Splits the markdown content into chunks based on paragraph and sentence breaks.
+
+        Args:
+            markdown_content (str): The markdown content to split.
+            min_chunk_size (int): Minimum size of each chunk.
+            max_chunk_size (int): Maximum size of each chunk.
+
+        Returns:
+            list: A list of markdown content chunks.
+        """
+        paragraphs = markdown_content.split('\n\n')
+        chunks = []
+        current_chunk = ""
+
+        for paragraph in paragraphs:
+            if not paragraph.strip():
+                continue  # Skip empty paragraphs
+            paragraph += '\n\n'  # Add paragraph break back
+
+            if len(current_chunk) + len(paragraph) <= max_chunk_size:
+                current_chunk += paragraph
+            else:
+                if len(current_chunk) >= min_chunk_size:
+                    chunks.append(current_chunk.strip())
+                    current_chunk = paragraph
+                else:
+                    # Try to split at sentence boundaries
+                    sentences = re.split(r'(?<=[.!?]) +', paragraph)
+                    for sentence in sentences:
+                        if len(current_chunk) + len(sentence) <= max_chunk_size:
+                            current_chunk += sentence + ' '
+                        else:
+                            if len(current_chunk) >= min_chunk_size:
+                                chunks.append(current_chunk.strip())
+                                current_chunk = sentence + ' '
+                            else:
+                                current_chunk += sentence + ' '
+                    current_chunk += '\n\n'
+
+        if current_chunk.strip():
+            chunks.append(current_chunk.strip())
+
+        return chunks
+
+    def polish_chunk_with_gpt(self, chunk):
+        """
+        Polishes a single chunk of markdown content using GPT-4 API.
+
+        Args:
+            chunk (str): The markdown chunk to polish.
+
+        Returns:
+            str: The polished markdown chunk.
+        """
+        prompt = f"""Fix the errors in OCR in the following text. Do not change the meaning of the content. Only fix the formatting of the content and typos within the text. Your output should only consist of the polished markdown text.
+
+{chunk}
+"""
+        openai.api_key = self.openai_api_key
+        try:
+            response = openai.ChatCompletion.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0,
+                max_tokens=2048,
+            )
+            polished_chunk = response['choices'][0]['message']['content']
+            return polished_chunk.strip()
+        except Exception as e:
+            print(f"Error during OpenAI API call: {e}")
+            return None
+
 
 # Example usage:
 if __name__ == "__main__":
@@ -248,8 +358,15 @@ if __name__ == "__main__":
     processor = DocumentProcessor(file_path, chunking=False)
     processor.preprocess()
     markdown_content = processor.convert_to_markdown()
-    # print(markdown_content)
-    # Optionally, save the markdown content to a file
+
+    # Process markdown_content with GPT-4 API in chunks
     if markdown_content:
-        output_markdown_file = 'output_document.md'
-        processor.save_markdown(output_markdown_file, markdown_text=markdown_content)
+        polished_markdown = processor.polish_markdown_with_gpt(markdown_content)
+        if polished_markdown:
+            # Optionally, save the polished markdown content to a file
+            output_markdown_file = 'polished_output_document.md'
+            processor.save_markdown(output_markdown_file, markdown_text=polished_markdown)
+        else:
+            print("Failed to polish markdown content.")
+    else:
+        print("No markdown content generated.")
