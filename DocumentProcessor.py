@@ -354,7 +354,7 @@ class DocumentProcessor:
 # Example usage:
 if __name__ == "__main__":
     # Replace with the path to your document
-    file_path = '/Users/samarthkumbla/Downloads/Elapsed Expectations Alan Lightman.pdf'
+    file_path = '/Users/samarthkumbla/Documents/Columbia/ContemporaryCivilizations/Sections - Nichomean Ethics/Book6 1-12.pdf'
     processor = DocumentProcessor(file_path, chunking=False)
     processor.preprocess()
     markdown_content = processor.convert_to_markdown()
@@ -364,7 +364,7 @@ if __name__ == "__main__":
         polished_markdown = processor.polish_markdown_with_gpt(markdown_content)
         if polished_markdown:
             # Optionally, save the polished markdown content to a file
-            output_markdown_file = 'polished_output_document.md'
+            output_markdown_file = '/Users/samarthkumbla/Documents/Columbia/ContemporaryCivilizations/Sections - Nichomean Ethics/Book6 1-12.md'
             processor.save_markdown(output_markdown_file, markdown_text=polished_markdown)
         else:
             print("Failed to polish markdown content.")
